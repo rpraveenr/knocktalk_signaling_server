@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KnockTalk - Video Call</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e; color: white;
+      font-family: -apple-system, sans-serif;
+      height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+    }
+    #status { font-size: 18px; margin-bottom: 20px; text-align: center; padding: 0 20px; }
+    #videos { width: 100%; display: flex; flex-direction: column; gap: 4px; }
+    video { width: 100%; max-height: 45vh; background: #000; object-fit: cover; }
+    #endBtn {
+      margin-top: 20px; background: #e63946; color: white; border: none;
+      padding: 16px 40px; border-radius: 50px; font-size: 18px; cursor: pointer; display: none;
+    }
+    .spinner {
+      width: 50px; height: 50px;
+      border: 4px solid rgba(255,255,255,0.2); border-top-color: white;
+      border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="waiting">
+    <div class="spinner" id="spinner"></div>
+    <div id="status">Connecting to KnockTalk...</div>
+  </div>
+  <div id="videos" style="display:none">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <video id="localVideo" autoplay playsinline muted></video>
+  </div>
+  <button id="endBtn" onclick="endCall('You ended the call.', false)">End Call</button>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const roomId = params.get('room');
+
+    const SIGNAL_SERVER = 'wss://knocktalk.duckdns.org';
+    const ICE_CONFIG = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        {
+          urls: ['turn:knocktalk.duckdns.org:3478', 'turns:knocktalk.duckdns.org:5349'],
+          username: 'knocktalkadm',
+          credential: 'BUuBetKwBf&daR@1!1'
+        }
+      ]
+    };
+
+    let ws, pc, localStream;
+    let pingInterval;
+    let callEnded = false;
+    let callStarted = false;
+
+    async function start() {
+      if (!roomId) {
+        document.getElementById('spinner').style.display = 'none';
+        document.getElementById('status').textContent = 'Invalid QR code.';
+        return;
+      }
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' }, audio: true
+        });
+        document.getElementById('localVideo').srcObject = localStream;
+
+        ws = new WebSocket(SIGNAL_SERVER);
+
+        ws.onopen = () => {
+          document.getElementById('status').textContent = 'Waiting for host to answer...';
+          ws.send(JSON.stringify({ type: 'guest-join', roomId }));
+          pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            }
+          }, 20000);
+        };
+
+        ws.onmessage = async (event) => {
+          const data = JSON.parse(event.data);
+          console.log('Received:', data.type);
+
+          if (data.type === 'waiting-for-host') {
+            document.getElementById('status').textContent = '🔔 Ringing... waiting for answer';
+          }
+
+          if (data.type === 'call-accepted') {
+            document.getElementById('status').textContent = 'Call accepted! Connecting...';
+            await setupPeerConnection();
+            ws.send(JSON.stringify({ type: 'guest-ready', roomId }));
+          }
+
+          if (data.type === 'call-ended' || data.type === 'host-disconnected') {
+            endCall('', true);
+          }
+
+          if (data.type === 'signal') {
+            const signal = data.signal;
+            if (signal.type === 'offer') {
+              if (!pc) await setupPeerConnection();
+              await pc.setRemoteDescription(new RTCSessionDescription(signal));
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: 'signal', roomId, signal: answer }));
+            }
+            if (signal.type === 'answer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal));
+            }
+            if (signal.candidate) {
+              try { await pc.addIceCandidate(new RTCIceCandidate(signal)); }
+              catch (e) { console.error('ICE error:', e); }
+            }
+          }
+        };
+
+        ws.onerror = () => {
+          document.getElementById('status').textContent = 'Connection error. Please try again.';
+        };
+
+        ws.onclose = () => clearInterval(pingInterval);
+
+      } catch (err) {
+        document.getElementById('status').textContent = 'Camera/mic access denied.';
+        console.error(err);
+      }
+    }
+
+    async function setupPeerConnection() {
+      if (pc) return;
+      pc = new RTCPeerConnection(ICE_CONFIG);
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'signal', roomId,
+            signal: {
+              candidate: event.candidate.candidate,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex
+            }
+          }));
+        }
+      };
+
+      pc.ontrack = (event) => {
+        if (callEnded) return;
+        callStarted = true;
+        document.getElementById('remoteVideo').srcObject = event.streams[0];
+        document.getElementById('waiting').style.display = 'none';
+        document.getElementById('videos').style.display = 'flex';
+        document.getElementById('endBtn').style.display = 'block';
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (callEnded) return;
+        console.log('Connection state:', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          callStarted = true;
+        }
+        if (callStarted && pc.connectionState === 'failed') {
+          endCall('Call disconnected.', false);
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => console.log('ICE state:', pc.iceConnectionState);
+    }
+
+    function endCall(reason, autoClose) {
+      if (callEnded) return;
+      callEnded = true;
+
+      clearInterval(pingInterval);
+      if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+      if (pc) { pc.close(); pc = null; }
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); ws = null; }
+
+      document.getElementById('remoteVideo').srcObject = null;
+      document.getElementById('localVideo').srcObject = null;
+      document.getElementById('videos').style.display = 'none';
+      document.getElementById('endBtn').style.display = 'none';
+      document.getElementById('waiting').style.display = 'flex';
+      document.getElementById('spinner').style.display = 'none';
+
+      if (autoClose) {
+        document.getElementById('status').innerHTML = `
+          <div style="text-align:center">
+            <div style="font-size:48px;margin-bottom:16px">📵</div>
+            <div style="font-size:22px;margin-bottom:8px">Call Ended</div>
+            <div style="font-size:14px;color:#aaa">Closing...</div>
+          </div>`;
+        setTimeout(() => window.close(), 2000);
+      } else {
+        document.getElementById('status').innerHTML = `
+          <div style="text-align:center">
+            <div style="font-size:48px;margin-bottom:16px">📵</div>
+            <div style="font-size:22px;margin-bottom:8px">Call Ended</div>
+            <div style="font-size:14px;color:#aaa;margin-bottom:32px">${reason}</div>
+            <button onclick="window.close()" style="
+              background:#e63946;color:white;border:none;
+              padding:14px 36px;border-radius:50px;
+              font-size:16px;cursor:pointer">Close</button>
+          </div>`;
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>
+EOF
