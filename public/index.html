@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>KnockTalk</title>
+  <script>
+    // Redirect /call?room=xxx to /call.html?room=xxx
+    const params = new URLSearchParams(window.location.search);
+    const room = params.get('room');
+    if (room) {
+      window.location.href = '/call.html?room=' + room;
+    }
+  </script>
+</head>
+<body>
+  <p>KnockTalk Signaling Server</p>
+</body>
+</html>
